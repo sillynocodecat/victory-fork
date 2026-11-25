@@ -677,6 +677,38 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Drops `d` on a thread kept for that (see [`HostList::reset`]).
+fn drop_away(d: Deferred) {
+    /// A list's recorded steps on their way to the dropping thread.
+    struct Away(Deferred);
+    // SAFETY: what a `Deferred` holds is D3D12 objects (free-threaded: released
+    // from any thread) and host copies behind `Arc`s; the list that recorded them
+    // has finished executing and no longer refers to them.
+    unsafe impl Send for Away {}
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TX: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Away>>>> =
+        std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DROP_AWAY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Away>();
+        std::thread::Builder::new()
+            .name("victory-dropper".into())
+            .spawn(move || while let Ok(Away(d)) = rx.recv() { drop(d) })
+            .ok()
+            .map(|_| std::sync::Mutex::new(tx))
+    });
+    match tx {
+        Some(tx) => {
+            if let Err(e) = tx.lock().unwrap_or_else(|e| e.into_inner()).send(Away(d)) {
+                drop(e.0);
+            }
+        }
+        None => drop(d),
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -5118,7 +5150,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        // What the list recorded (thousands of steps holding host copies) is
+        // dropped on a thread of its own, not on the title thread that resets the
+        // list (`VICTORY_DROP_AWAY=0`: here, as before).
+        let old = std::mem::take(&mut *self.deferred());
+        drop_away(old);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
